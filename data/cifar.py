@@ -236,7 +236,7 @@ def get_cifar_100_datasets(train_transform, test_transform, config_dict, train_c
     online_novel_seen_num = config_dict['online_novel_seen_num']
 
     # Init entire training set
-    whole_training_set = CustomCIFAR100(root=cifar_10_root, transform=train_transform, train=True)
+    whole_training_set = CustomCIFAR100(root=cifar_100_root, transform=train_transform, train=True)
 
     # Get labelled training set which has subsampled classes, then subsample some indices from that
     old_dataset_all = subsample_classes(deepcopy(whole_training_set), include_classes=train_classes)  # 40000
