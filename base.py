@@ -43,6 +43,165 @@ update 1: [2024-05-04] hardness-aware prototype sampling
 '''
 
 
+'''====================================================================================================================='''
+'''SOP: Selective Old-Class Protection Module'''
+'''====================================================================================================================='''
+class SelectiveOldClassProtection:
+    """
+    基于簇置信度的选择性旧类保护模块
+    
+    核心思想:
+    - 不是"是否保护旧类",而是"保护哪些旧类、保护到什么程度"
+    - 高稳定旧类 → 强保护
+    - 低稳定旧类 → 弱保护(允许适配)
+    """
+    
+    def __init__(self, num_old_classes, lambda_max=1.0, lambda_min=0.1, 
+                 stability_momentum=0.9, use_entropy=True):
+        """
+        Args:
+            num_old_classes: 旧类的数量
+            lambda_max: 最大正则化强度 (高稳定类)
+            lambda_min: 最小正则化强度 (低稳定类)
+            stability_momentum: 稳定性得分的动量更新系数
+            use_entropy: 是否使用熵作为稳定性度量(False则使用最大置信度)
+        """
+        self.num_old_classes = num_old_classes
+        self.lambda_max = lambda_max
+        self.lambda_min = lambda_min
+        self.stability_momentum = stability_momentum
+        self.use_entropy = use_entropy
+        
+        # 存储每个旧类的稳定性得分
+        self.stability_scores = None
+        # 存储每个旧类的正则化权重
+        self.lambda_weights = None
+        
+    def compute_stability_scores(self, model, data_loader, device):
+        """
+        计算每个旧类的稳定性得分
+        
+        Args:
+            model: 当前模型
+            data_loader: 数据加载器
+            device: 设备
+            
+        Returns:
+            stability_scores: shape (num_old_classes,) 每个旧类的稳定性得分
+        """
+        model.eval()
+        
+        # 累积每个类别的置信度/熵
+        class_confidence_sum = torch.zeros(self.num_old_classes).to(device)
+        class_entropy_sum = torch.zeros(self.num_old_classes).to(device)
+        class_count = torch.zeros(self.num_old_classes).to(device)
+        
+        with torch.no_grad():
+            for batch_idx, batch in enumerate(data_loader):
+                if len(batch) == 4:  # online training format
+                    images, class_labels, uq_idxs, _ = batch
+                else:  # offline training format
+                    images, class_labels, uq_idxs = batch
+                    
+                images = torch.cat(images, dim=0).cuda(non_blocking=True)
+                
+                _, logits = model(images)
+                probs = torch.softmax(logits / 0.1, dim=-1)
+                
+                # 只考虑旧类的输出
+                old_probs = probs[:, :self.num_old_classes]
+                
+                # 计算每个样本对每个旧类的置信度
+                max_probs, pred_classes = old_probs.max(dim=1)
+                
+                # 计算熵
+                entropy = -(old_probs * (old_probs + 1e-10).log()).sum(dim=1)
+                
+                # 累积统计
+                for k in range(self.num_old_classes):
+                    mask = (pred_classes == k)
+                    if mask.sum() > 0:
+                        class_confidence_sum[k] += max_probs[mask].sum()
+                        class_entropy_sum[k] += entropy[mask].sum()
+                        class_count[k] += mask.sum()
+        
+        # 计算平均值
+        class_count = torch.clamp(class_count, min=1.0)  # 避免除零
+        avg_confidence = class_confidence_sum / class_count
+        avg_entropy = class_entropy_sum / class_count
+        
+        # 根据选择使用置信度或熵作为稳定性度量
+        if self.use_entropy:
+            # 熵越低 → 稳定性越高
+            # 归一化到 [0, 1], 其中1表示最稳定
+            max_entropy = avg_entropy.max()
+            min_entropy = avg_entropy.min()
+            if max_entropy > min_entropy:
+                stability = 1.0 - (avg_entropy - min_entropy) / (max_entropy - min_entropy + 1e-10)
+            else:
+                stability = torch.ones_like(avg_entropy)
+        else:
+            # 置信度越高 → 稳定性越高
+            # 直接使用平均置信度作为稳定性
+            stability = avg_confidence
+        
+        # 动量更新稳定性得分
+        if self.stability_scores is None:
+            self.stability_scores = stability
+        else:
+            self.stability_scores = (self.stability_momentum * self.stability_scores + 
+                                   (1 - self.stability_momentum) * stability)
+        
+        return self.stability_scores
+    
+    def compute_lambda_weights(self):
+        """
+        根据稳定性得分计算每个旧类的正则化权重
+        
+        Returns:
+            lambda_weights: shape (num_old_classes,) 每个旧类的正则化权重
+        """
+        if self.stability_scores is None:
+            # 如果还没有计算稳定性得分,使用均匀权重
+            self.lambda_weights = torch.ones(self.num_old_classes) * \
+                                 (self.lambda_max + self.lambda_min) / 2
+        else:
+            # lambda(s_k) = lambda_min + (lambda_max - lambda_min) * s_k
+            self.lambda_weights = (self.lambda_min + 
+                                 (self.lambda_max - self.lambda_min) * self.stability_scores)
+        
+        return self.lambda_weights
+    
+    def compute_sop_loss(self, model_cur, model_prev):
+        """
+        计算选择性旧类保护损失
+        
+        L_sop = sum_{k in C_old} lambda(s_k) * ||w_k - w_k^prev||^2
+        
+        Args:
+            model_cur: 当前模型
+            model_prev: 上一阶段的模型
+            
+        Returns:
+            sop_loss: 选择性旧类保护损失
+        """
+        if self.lambda_weights is None:
+            self.compute_lambda_weights()
+        
+        # 获取当前和之前的分类器权重
+        w_cur = model_cur[1].last_layer.weight[:self.num_old_classes]  # (num_old_classes, feat_dim)
+        w_prev = model_prev[1].last_layer.weight[:self.num_old_classes]  # (num_old_classes, feat_dim)
+        
+        # 计算每个类的权重偏移
+        weight_diff = (w_cur - w_prev).pow(2).sum(dim=1)  # (num_old_classes,)
+        
+        # 应用类别特定的正则化权重
+        lambda_weights = self.lambda_weights.to(weight_diff.device)
+        sop_loss = (lambda_weights * weight_diff).mean()
+        
+        return sop_loss
+
+
 class ProtoAugManager:
     def __init__(self, feature_dim, batch_size, hardness_temp, radius_scale, device, logger):
         self.feature_dim = feature_dim
@@ -581,7 +740,7 @@ def test_offline(model, test_loader, epoch, save_name, args):
 
 '''online train and test'''
 '''====================================================================================================================='''
-def train_online(student, student_pre, proto_aug_manager, train_loader, test_loader, current_session, args):
+def train_online(student, student_pre, proto_aug_manager, sop_module, train_loader, test_loader, current_session, args):
 
     params_groups = get_params_groups(student)
     optimizer = SGD(params_groups, lr=args.lr, momentum=args.momentum, weight_decay=args.weight_decay)
@@ -592,8 +751,14 @@ def train_online(student, student_pre, proto_aug_manager, train_loader, test_loa
             eta_min=args.lr * 1e-3,
         )
 
+    # 确保 warmup epochs 不超过总 epochs
+    warmup_epochs = min(args.warmup_teacher_temp_epochs, args.epochs_online_per_session - 1)
+    if warmup_epochs < args.warmup_teacher_temp_epochs:
+        args.logger.info(f'Warning: warmup_teacher_temp_epochs ({args.warmup_teacher_temp_epochs}) >= epochs_online_per_session ({args.epochs_online_per_session})')
+        args.logger.info(f'Adjusted warmup_teacher_temp_epochs to {warmup_epochs}')
+
     cluster_criterion = DistillLoss(
-                        args.warmup_teacher_temp_epochs,
+                        warmup_epochs,
                         args.epochs_online_per_session,
                         args.n_views,
                         args.warmup_teacher_temp,
@@ -609,8 +774,23 @@ def train_online(student, student_pre, proto_aug_manager, train_loader, test_loa
     best_test_acc_seen = 0
     best_test_acc_unseen = 0
 
+    device = torch.device('cuda:0')
+
     for epoch in range(args.epochs_online_per_session):
         loss_record = AverageMeter()
+
+        # 在每个epoch开始时更新稳定性得分
+        if epoch % args.sop_update_freq == 0 and current_session >= 1 and args.sop_weight > 0:
+            args.logger.info('Computing stability scores for old classes...')
+            sop_module.compute_stability_scores(student, train_loader, device)
+            sop_module.compute_lambda_weights()
+            
+            # 记录稳定性得分和权重
+            if args.sop_log_stability:
+                stability_str = 'Stability scores: ' + ' '.join([f'{s:.3f}' for s in sop_module.stability_scores.cpu().numpy()])
+                lambda_str = 'Lambda weights: ' + ' '.join([f'{l:.3f}' for l in sop_module.lambda_weights.cpu().numpy()])
+                args.logger.info(stability_str)
+                args.logger.info(lambda_str)
 
         student.train()
         student_pre.eval()
@@ -665,12 +845,21 @@ def train_online(student, student_pre, proto_aug_manager, train_loader, test_loa
                 feats_pre = torch.nn.functional.normalize(feats_pre, dim=-1)
             feat_distill_loss = (feats-feats_pre).pow(2).sum() / len(feats)
 
+            # ========================================
+            # SOP Loss: Selective Old-Class Protection
+            # ========================================
+            if current_session >= 1 and args.sop_weight > 0:
+                sop_loss = sop_module.compute_sop_loss(student, student_pre)
+            else:
+                sop_loss = torch.tensor(0.0, device=device)
+
             # Total loss
             loss = 0
             loss += 1 * cluster_loss
             loss += 1 * contrastive_loss
             loss += args.proto_aug_weight * proto_aug_loss
             loss += args.feat_distill_weight * feat_distill_loss
+            loss += args.sop_weight * sop_loss  # 添加SOP损失
 
             # logs
             pstr = ''
@@ -681,6 +870,7 @@ def train_online(student, student_pre, proto_aug_manager, train_loader, test_loa
             pstr += f'contrastive_loss: {contrastive_loss.item():.4f} '
             pstr += f'proto_aug_loss: {proto_aug_loss.item():.4f} '
             pstr += f'feat_distill_loss: {feat_distill_loss.item():.4f} '
+            pstr += f'sop_loss: {sop_loss.item():.4f} '  # 记录SOP损失
 
             loss_record.update(loss.item(), class_labels.size(0))
             optimizer.zero_grad()
@@ -829,6 +1019,15 @@ if __name__ == "__main__":
 
     '''hardness-aware sampling temperature'''
     parser.add_argument('--hardness_temp', type=float, default=0.1)
+
+    '''SOP params - Selective Old-Class Protection'''
+    parser.add_argument('--sop_weight', type=float, default=0.0, help='Weight for SOP loss (0=disabled)')
+    parser.add_argument('--sop_lambda_max', type=float, default=1.0, help='Max regularization strength for stable old classes')
+    parser.add_argument('--sop_lambda_min', type=float, default=0.1, help='Min regularization strength for unstable old classes')
+    parser.add_argument('--sop_momentum', type=float, default=0.9, help='Momentum for stability score update')
+    parser.add_argument('--sop_use_entropy', action='store_true', default=True, help='Use entropy as stability metric')
+    parser.add_argument('--sop_update_freq', type=int, default=5, help='Frequency (epochs) to update stability scores')
+    parser.add_argument('--sop_log_stability', action='store_true', default=True, help='Log stability scores and lambda weights')
 
     # Continual GCD params
     parser.add_argument('--num_old_classes', type=int, default=-1)
@@ -1133,6 +1332,33 @@ if __name__ == "__main__":
             ####################################################################################################################
             ####################################################################################################################
 
+            '''Initialize SOP module'''
+            ####################################################################################################################
+            if session == 0:
+                # 第一个在线session,初始化SOP模块
+                sop_module = SelectiveOldClassProtection(
+                    num_old_classes=args.num_labeled_classes,
+                    lambda_max=args.sop_lambda_max,
+                    lambda_min=args.sop_lambda_min,
+                    stability_momentum=args.sop_momentum,
+                    use_entropy=args.sop_use_entropy
+                )
+                if args.sop_weight > 0:
+                    args.logger.info('Initialized SOP module with {} old classes'.format(args.num_labeled_classes))
+                    args.logger.info(f'SOP params: weight={args.sop_weight}, lambda_max={args.sop_lambda_max}, lambda_min={args.sop_lambda_min}')
+            else:
+                # 后续session,更新旧类数量为所有已见过的类
+                sop_module = SelectiveOldClassProtection(
+                    num_old_classes=args.num_seen_classes,
+                    lambda_max=args.sop_lambda_max,
+                    lambda_min=args.sop_lambda_min,
+                    stability_momentum=args.sop_momentum,
+                    use_entropy=args.sop_use_entropy
+                )
+                if args.sop_weight > 0:
+                    args.logger.info('Updated SOP module with {} seen classes'.format(args.num_seen_classes))
+            ####################################################################################################################
+
             '''compute prototypes offline (session = 0)'''
             if session == 0:
                 args.logger.info('Before Train: compute offline prototypes and radius from {} classes with the best model...'.format(args.num_labeled_classes))
@@ -1147,9 +1373,9 @@ if __name__ == "__main__":
                 proto_aug_manager.save_proto_aug_dict(save_path)
 
             # ----------------------
-            # TRAIN
+            # TRAIN WITH SOP
             # ----------------------
-            train_online(model_cur, model_pre, proto_aug_manager, online_session_train_loader, online_session_test_loader, session+1, args)
+            train_online(model_cur, model_pre, proto_aug_manager, sop_module, online_session_train_loader, online_session_test_loader, session+1, args)
 
             '''compute prototypes online after train (session > 0)'''
             #############################################################################################################
