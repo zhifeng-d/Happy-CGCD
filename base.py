@@ -1055,13 +1055,27 @@ if __name__ == "__main__":
     warmup_teacher_temp=0.05,
     teacher_temp=0.05,
     warmup_teacher_temp_epochs=10,
-    lr=0.1,
-    memax_old_new_weight=1,
-    memax_old_in_weight=1,
-    memax_new_in_weight=1,
-    proto_aug_weight=1.0,
-    feat_distill_weight=1.0,
+    lr=0.015,  # 从0.01提高到0.015，增强探索能力
+    
+    # Me-Max权重：增强新类发现
+    memax_old_new_weight=6.0,  # 从1提高到6，强烈鼓励新旧类平衡
+    memax_old_in_weight=1.0,   # 保持1.0
+    memax_new_in_weight=2.5,   # 从1提高到2.5，鼓励新类内部均匀分布
+    
+    # 保护机制：适度减弱，为新类学习留出空间
+    proto_aug_weight=0.4,      # 从1.0降到0.4
+    feat_distill_weight=0.4,   # 从1.0降到0.4
     radius_scale=1.0,
+    
+    # SOP参数：轻度自适应保护
+    sop_weight=3.0,            # 启用SOP，适中强度
+    sop_lambda_max=0.8,        # 高稳定类的最大正则化强度（不要太大）
+    sop_lambda_min=0.05,       # 低稳定类的最小正则化强度（允许充分适应）
+    sop_momentum=0.9,          # 稳定性得分的动量系数
+    sop_use_entropy=True,      # 使用熵作为稳定性度量
+    sop_update_freq=5,         # 每5个epoch更新稳定性得分
+    sop_log_stability=True,    # 记录稳定性得分和lambda权重
+    
     eval_funcs=['v2'],
     num_old_classes=100,
     prop_train_labels=0.8,
